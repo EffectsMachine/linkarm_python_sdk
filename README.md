@@ -11,7 +11,7 @@
 
 它适合用于：
 
-- 桌面调试
+- 模块化调试
 - 教学演示
 - 自动化脚本
 - Raspberry Pi / Jetson 机器人本体集成
@@ -29,7 +29,7 @@
 - [环境准备](#环境准备)
 - [第一次连接机械臂](#第一次连接机械臂)
 - [查找串口号并修改配置文件](#查找串口号并修改配置文件)
-- [舵机中位校准说明非常重要](#舵机中位校准说明非常重要)
+- [舵机中位校准说明（非常重要）](#舵机中位校准说明非常重要)
 - [快速让机械臂动起来](#快速让机械臂动起来)
 - [配置文件示例](#配置文件示例)
 - [CLI 命令总览](#cli-命令总览)
@@ -495,7 +495,7 @@ python linkarm.py joint 3 -1 --reliable
 
 ### 4. 测试机械臂笛卡尔运动
 
-`ik-now`后面的参数代表 `[x, y, z]` 坐标值，单位为`mm`
+`ik-now`后面的参数代表 `[x, y, z]` 坐标值，单位为`mm`，坐标轴定义如下图所示：
 
 ```bash
 python linkarm.py ik-now 250 0 60
@@ -518,14 +518,35 @@ IK_FAILED
 {
   "linkarm": {
     "device_info_keyword": "CH343",
-    "default_device_serial_ports": "COM7",
+    "default_device_serial_ports": "COM1",
     "serial_baudrate": 500000,
     "joint_type": "scs",
-    "joint_id": [31, 32, 33, 34],
+    "joint_id": [
+      31,
+      32,
+      33,
+      34
+    ],
     "gripper_torque_limit": 200,
     "node_id": 40,
-    "servo_middle": [513, 508, 327, 632],
-    "joint_direction": [1, 1, 1, 1],
+    "servo_middle": [
+      511,
+      511,
+      511,
+      511
+    ],
+    "joint_direction": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "joint_limit": [
+      [-1.5708, 1.5708],
+      [-1.5708, 1.5708],
+      [-0.8, 2],
+      [-1.5, 0]
+    ],
     "link_ab": 224.0,
     "link_bc": 145.0,
     "link_cd_1": 24.0,
@@ -543,6 +564,11 @@ IK_FAILED
       "id_address": 5,
       "torque_limit_address": 16,
       "torque_lock_address": 40
+    },
+    "hls": {
+      "joint_range_rad": 6.28318530718,
+      "joint_range_steps": 4096,
+      "joint_range_angle": 360.0
     }
   }
 }
@@ -597,14 +623,6 @@ python linkarm.py <command> [args]
 
 ```bash
 python linkarm.py status
-```
-
-### fk
-
-读取当前反馈位置并计算 FK：
-
-```bash
-python linkarm.py fk
 ```
 
 ### joints
@@ -666,6 +684,12 @@ python linkarm.py ik-now 250 0 60
 
 FPV 风格控制：
 
+此控制方式主要用于将摄像头安装在机械臂末端，采用第一人称视角来控制机械臂时，使用这种控制方式更加直观。
+
+- 第一个参数是底座的旋转角度，角度采用弧度制。
+- 第二个参数是末端点向前伸长的距离，单位mm。
+- 第三个参数是末端点的高度，单位mm。
+
 ```bash
 python linkarm.py fpv 1.0 250 60
 ```
@@ -673,6 +697,10 @@ python linkarm.py fpv 1.0 250 60
 ### led
 
 控制板载 LED 颜色，参数范围：`0 ~ 8`。
+
+- 第一个参数是 R-红色通道，数值越大该通道颜色越亮。
+- 第一个参数是 G-绿色通道，数值越大该通道颜色越亮。
+- 第一个参数是 B-蓝色通道，数值越大该通道颜色越亮。
 
 ```bash
 python linkarm.py led 8 0 0
@@ -688,16 +716,21 @@ python linkarm.py led 8 8 8
 - `0`
 - `1`
 
+PWM 数值支持 `0~1024`，对应 `0~100%` 的PWM，用于控制开关接口的输出电压，100% 的 PWM 代表开关口输出总线的供电电压，用户可使用这个接口来控制 LED 补光灯、电磁铁、电磁阀等直流设备，但是需要注意 PWM 与输出电压并非完全线性的关系。
+
 例如：
 
 ```bash
 python linkarm.py pwm 0 500
-python linkarm.py pwm 1 1000
+python linkarm.py pwm 1 1025
 ```
 
 ### torque-lock
 
 舵机扭矩开关：
+
+- 第一个参数为舵机 ID。
+- 第二个参数为 1 是，代表输出扭矩；0 - 关闭扭矩输出。
 
 ```bash
 python linkarm.py torque-lock 31 1
@@ -708,6 +741,9 @@ python linkarm.py torque-lock 31 0
 
 设置某个舵机的扭矩限制：
 
+- 第一个参数为舵机 ID。
+- 第二个参数为最大扭矩，1000代表不限制最大扭矩，200代表限制最大扭矩到20%。
+
 ```bash
 python linkarm.py torque-limit 34 200
 ```
@@ -715,6 +751,8 @@ python linkarm.py torque-limit 34 200
 ### torque-off-all
 
 关闭所有关节扭矩：
+
+所有关节的扭矩都关闭后，可以用手调整机械臂的姿态。
 
 ```bash
 python linkarm.py torque-off-all
@@ -1020,7 +1058,7 @@ arm2.move_joint_rad(1, -0.2)
 ### Windows
 
 1. 安装 Python
-2. 安装 CH343 / CH340 驱动（如有需要）
+2. 安装 CH343 驱动(一般情况都是自动安装的)
 3. 打开设备管理器确认 COM 口
 4. 修改 `arm_config.json` 中的 `default_device_serial_ports`
 5. 按贴纸修改 `servo_middle`
@@ -1057,7 +1095,7 @@ python3 linkarm.py ik-now 250 0 60
 
 ```bash
 python3 linkarm.py status
-python3 linkarm.py fk
+python3 linkarm.py gripper -1
 python3 linkarm.py ik-now 250 0 60
 ```
 
@@ -1115,7 +1153,6 @@ python linkarm.py status
 python linkarm.py gripper -1
 python linkarm.py gripper 0
 python linkarm.py ik-now 250 0 60
-python linkarm.py fk
 ```
 
 ### 示例 2：批量动作

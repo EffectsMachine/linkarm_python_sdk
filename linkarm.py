@@ -1897,7 +1897,7 @@ def _run_interactive_shell(arm: RobotController, json_output: bool = False):
     help_text = """
 Available commands:
   status
-  joints j1 j2 j3 [j4] [speed]
+  joints j0 j1 j2 j3 [speed]
   joint INDEX RAD [speed] [acc]
   joint INDEX RAD --reliable
   jointr INDEX RAD [speed] [acc]
