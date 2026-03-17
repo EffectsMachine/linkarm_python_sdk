@@ -254,25 +254,9 @@ source venv/bin/activate
 
 ### 4. 安装依赖
 
-如果项目中有 `requirements.txt`：
-
 ```bash
 pip install -r requirements.txt
 ```
-
-如果暂时没有，至少需要：
-
-```bash
-pip install pyserial
-```
-
-如果你使用飞特 SCS 舵机，还需要保证 Python 能正确导入对应 SDK，例如：
-
-```bash
-pip install FTServo-Python
-```
-
-或者将本地 `scservo_sdk` 放在 Python 可导入路径中。
 
 ---
 
