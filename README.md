@@ -232,7 +232,7 @@ python --version
 ### 2. 获取项目
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/EffectsMachine/linkarm_python_sdk.git
 cd linkarm_module
 ```
 
