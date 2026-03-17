@@ -17,6 +17,8 @@
 - Raspberry Pi / Jetson 机器人本体集成
 - AI 模型或代理程序控制机械臂
 
+![](./README/A.png)
+
 ---
 
 ## 目录
@@ -445,6 +447,12 @@ python -m serial.tools.list_ports
 - **不要使用中文逗号 `，`**
 - 不要漏数字
 
+### 如何验证中位参数
+
+当使用 `joints 0 0 0 0` 控制机械臂时，机械臂的姿态如下图所示：
+
+![](./README/C.png)
+
 ---
 
 ## 快速让机械臂动起来
@@ -496,6 +504,8 @@ python linkarm.py joint 3 -1 --reliable
 ### 4. 测试机械臂笛卡尔运动
 
 `ik-now`后面的参数代表 `[x, y, z]` 坐标值，单位为`mm`，坐标轴定义如下图所示：
+
+![](./README/B.png)
 
 ```bash
 python linkarm.py ik-now 250 0 60
