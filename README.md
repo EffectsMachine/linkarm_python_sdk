@@ -495,7 +495,7 @@ python linkarm.py joint 3 -1 --reliable
 
 ### 4. 测试机械臂笛卡尔运动
 
-`ik-now`后面的参数代表 `[x, y, z]` 坐标值，单位为`mm`，坐标轴定义如下图所示：
+`ik-now`后面的参数代表 `[x, y, z]` 坐标值，单位为`mm`
 
 ```bash
 python linkarm.py ik-now 250 0 60
@@ -518,35 +518,14 @@ IK_FAILED
 {
   "linkarm": {
     "device_info_keyword": "CH343",
-    "default_device_serial_ports": "COM1",
+    "default_device_serial_ports": "COM7",
     "serial_baudrate": 500000,
     "joint_type": "scs",
-    "joint_id": [
-      31,
-      32,
-      33,
-      34
-    ],
+    "joint_id": [31, 32, 33, 34],
     "gripper_torque_limit": 200,
     "node_id": 40,
-    "servo_middle": [
-      511,
-      511,
-      511,
-      511
-    ],
-    "joint_direction": [
-      1,
-      1,
-      1,
-      1
-    ],
-    "joint_limit": [
-      [-1.5708, 1.5708],
-      [-1.5708, 1.5708],
-      [-0.8, 2],
-      [-1.5, 0]
-    ],
+    "servo_middle": [513, 508, 327, 632],
+    "joint_direction": [1, 1, 1, 1],
     "link_ab": 224.0,
     "link_bc": 145.0,
     "link_cd_1": 24.0,
@@ -564,11 +543,6 @@ IK_FAILED
       "id_address": 5,
       "torque_limit_address": 16,
       "torque_lock_address": 40
-    },
-    "hls": {
-      "joint_range_rad": 6.28318530718,
-      "joint_range_steps": 4096,
-      "joint_range_angle": 360.0
     }
   }
 }
