@@ -23,6 +23,15 @@ except Exception:
 
 class RobotController:
     """
+    Robot controller
+
+    Design goals:
+    1. Use a dedicated I/O thread to own the bus and avoid read/write collisions.
+    2. For high-rate joint commands, only keep the newest target and allow older ones to be dropped.
+    3. Low-frequency but important commands such as LED / switch / PWM are queued reliably and must not be dropped.
+    4. The interpolation/planner thread never touches the bus directly; it only generates targets and passes them to the high-rate motion slot.
+    5. When a new interpolated target arrives, the previous trajectory is invalidated immediately and control switches to the new one.
+
     机器人控制器
 
     设计目标：
@@ -45,7 +54,7 @@ class RobotController:
         auto_connect: bool = True,
         direct_read_period: float = 0.02,
         json_read_chunk: int = 256,
-        planner_period: float = 0.001,   # 插值线程步进周期
+        planner_period: float = 0.001,   # 插值线程步进周期 / planner thread step period
     ):
         self.config_path = str(Path(config_path).expanduser().resolve())
         self.communication_mode = communication_mode.strip().lower()
@@ -96,7 +105,9 @@ class RobotController:
         self.packet_handler = None
 
         # =============================
-        # IK pre-rendering
+        # IK 参数预计算 / IK parameter pre-computation
+        # 提前把几何尺寸换算成后续 IK/FK 计算更方便使用的形式。
+        # Precompute geometric parameters used repeatedly by IK/FK routines.
         # =============================
         self.l_ab = self.linkarm_cfg.get("link_ab")
         self.l_bc = self.linkarm_cfg.get("link_bc")
@@ -115,29 +126,34 @@ class RobotController:
                              ]
 
         # =============================
-        # 总线 / 线程控制
-        # =============================
+        # 总线与线程控制 / Bus and thread control
+        # 用事件和锁协调 I/O 线程、规划线程与主线程之间的访问。
+        # Events and locks coordinate the I/O thread, planner thread, and caller thread.
         self.stop_event = threading.Event()
         self.wakeup_event = threading.Event()
         self.io_thread: Optional[threading.Thread] = None
         self.bus_lock = threading.RLock()
 
         # =============================
-        # 分槽命令设计
+        # 分槽命令设计 / Split command-lane design
+        # 不同优先级的命令进入不同槽位，避免高频命令挤掉关键控制。
+        # Commands with different priorities go to different lanes so bursty motion traffic does not starve critical controls.
         # =============================
-        # 高频槽：关节/底盘控制，只保留最新
+        # 高频槽：关节/底盘控制，只保留最新 / High-rate slot: joint/chassis control, keep newest only
         self.pending_joint_motion: Optional[Dict[str, Any]] = None
 
-        # 可靠队列：灯光、开关、PWM 等，不能丢
+        # 可靠队列：灯光、开关、PWM 等，不能丢 / Reliable queue: LED, switch, PWM, etc. must not be lost
         self.pending_reliable_commands: Deque[Dict[str, Any]] = deque()
 
-        # json 模式写入：高频槽
+        # json 模式写入：高频槽 / JSON-mode write slot for high-rate commands
         self.pending_json_write: Optional[Dict[str, Any]] = None
 
         self.pending_lock = threading.Lock()
 
         # =============================
-        # 反馈缓存
+        # 反馈缓存 / Feedback caches
+        # 保存最近一次反馈、最近一次关节角，以及 JSON 接收缓冲区。
+        # Store the latest feedback, latest joint radians, and the JSON RX buffers.
         # =============================
         self.latest_feedback_lock = threading.Lock()
         self.latest_feedback: Dict[str, Any] = {
@@ -149,7 +165,7 @@ class RobotController:
         self.last_joint_radians_lock = threading.Lock()
         self.last_joint_radians: List[float] = [0.0] * self.joint_count
 
-        # JSON 接收缓存
+        # JSON 接收缓存 / JSON receive buffer
         self.json_rx_buffer = bytearray()
         self.json_rx_queue: List[Dict[str, Any]] = []
         self.json_rx_lock = threading.Lock()
@@ -157,7 +173,9 @@ class RobotController:
         self.last_direct_read_time = 0.0
 
         # =============================
-        # 插值 / 规划线程
+        # 插值 / 规划线程 / Interpolation and planner thread
+        # 负责把笛卡尔目标离散成一系列小步关节目标。
+        # Responsible for discretizing a Cartesian target into a sequence of small joint targets.
         # =============================
         self.planner_wakeup_event = threading.Event()
         self.planner_thread: Optional[threading.Thread] = None
@@ -179,13 +197,25 @@ class RobotController:
         self.torque_limit(self.joint_ids[3], self.gripper_torque_limit)
 
     # =====================================================
-    # 基础
+    # 基础功能 / Basic helpers
     # =====================================================
     def _load_config(self, path: str) -> Dict[str, Any]:
+        """
+        加载配置文件 / Load configuration file.
+
+        从 JSON 文件读取整机参数、关节参数和通信参数。
+        Read robot, joint, and communication parameters from a JSON file.
+        """
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
     def guess_serial_device(self, keyword: str = "CH343") -> Optional[str]:
+        """
+        猜测最匹配的串口设备 / Guess the best-matching serial device.
+
+        会遍历系统串口，把 device/description/manufacturer/product/hwid 合并后做关键字匹配。
+        Iterates over system serial ports and performs keyword matching across multiple descriptor fields.
+        """
         keyword = keyword.lower()
         matched = []
 
@@ -207,6 +237,12 @@ class RobotController:
         return matched[-1]
 
     def resolve_serial_port(self) -> str:
+        """
+        解析实际串口号 / Resolve the actual serial port name.
+
+        优先使用显式指定端口，其次使用配置中的默认端口，最后再尝试关键字猜测。
+        Prefer the explicit port, then the configured default port, and finally keyword-based guessing.
+        """
         if self.serial_port_name:
             return self.serial_port_name
 
@@ -218,9 +254,11 @@ class RobotController:
         raise RuntimeError(f"No Keyword: {self.device_keyword} device found")
 
     def rad_to_step(self, joint_index: int, rad: float) -> int:
+        """将关节弧度换算为舵机步数 / Convert joint radians to servo steps."""
         return int(round(self.servo_middle[joint_index] + rad * self.rad_to_step_coefficient))
 
     def clamp_joint_rad(self, joint_index: int, rad: float) -> float:
+        """按关节限位裁剪单个关节角 / Clamp one joint angle using configured joint limits."""
         if not (0 <= joint_index < self.joint_count):
             raise IndexError(f"joint_index out of range: {joint_index}")
 
@@ -241,6 +279,7 @@ class RobotController:
 
 
     def clamp_joint_radians(self, joint_radians: Sequence[float]) -> List[float]:
+        """批量裁剪关节角 / Clamp a sequence of joint angles."""
         result: List[float] = []
         for i, rad in enumerate(joint_radians):
             if i >= self.joint_count:
@@ -256,9 +295,10 @@ class RobotController:
         return self.port_handler is not None and self.packet_handler is not None
 
     # =====================================================
-    # 连接
+    # 连接 / Connection management
     # =====================================================
     def connect(self):
+        """建立通信并启动后台线程 / Establish communication and start background threads."""
         if self.communication_mode == "direct_servo":
             self._connect_direct_servo()
         else:
@@ -268,6 +308,7 @@ class RobotController:
         self._start_planner_thread()
 
     def disconnect(self):
+        """断开通信并停止后台线程 / Disconnect communication and stop background threads."""
         self._stop_planner_thread()
         self._stop_io_thread()
 
@@ -289,6 +330,7 @@ class RobotController:
                 self.packet_handler = None
 
     def _connect_direct_servo(self):
+        """初始化 direct_servo 模式 / Initialize direct_servo mode."""
         if PortHandler is None or scscl is None:
             raise ImportError("没有找到 scservo_sdk")
 
@@ -302,6 +344,7 @@ class RobotController:
             raise RuntimeError(f"设置波特率失败: {self.baudrate}")
 
     def _connect_json(self):
+        """初始化 JSON 串口模式 / Initialize JSON-over-UART mode."""
         port = self.resolve_serial_port()
         self.serial_connection = serial.Serial(
             port=port,
@@ -317,9 +360,10 @@ class RobotController:
             pass
 
     # =====================================================
-    # I/O 线程
+    # I/O 线程 / I/O thread
     # =====================================================
     def _start_io_thread(self):
+        """启动总线 I/O 线程 / Start the bus I/O thread."""
         if self.io_thread is not None and self.io_thread.is_alive():
             return
 
@@ -329,6 +373,7 @@ class RobotController:
         self.io_thread.start()
 
     def _stop_io_thread(self):
+        """停止总线 I/O 线程 / Stop the bus I/O thread."""
         self.stop_event.set()
         self.wakeup_event.set()
 
@@ -338,10 +383,15 @@ class RobotController:
 
     def _io_loop(self):
         """
-        优先级：
+        I/O 主循环 / I/O main loop
+
+        优先级 / Priority:
         1. reliable queue（不能丢的控制）
+           Reliable queue: must-deliver commands.
         2. joint motion slot（高频、可丢）
+           Joint motion slot: high-rate commands where older targets may be dropped.
         3. 读取反馈
+           Read feedback when there is no pending write work.
         """
         idle_wait = 0.002
 
@@ -397,6 +447,12 @@ class RobotController:
                 self.wakeup_event.clear()
 
     def _take_pending_writes(self):
+        """
+        取出当前待发送命令 / Pop pending commands for one I/O cycle.
+
+        顺序为：可靠队列 -> 关节高频槽 -> JSON 高频槽。
+        Order: reliable queue -> joint motion slot -> JSON write slot.
+        """
         with self.pending_lock:
             reliable_cmd = None
             if self.pending_reliable_commands:
@@ -411,7 +467,7 @@ class RobotController:
             return reliable_cmd, joint_cmd, json_cmd
 
     # =====================================================
-    # 对外写接口
+    # 对外写接口 / Public write APIs
     # =====================================================
     def move_joints_rad_sync(
         self,
@@ -420,6 +476,14 @@ class RobotController:
         acc,
         blocking: bool = False,
     ):
+        """
+        同步下发多关节目标 / Submit a multi-joint target.
+
+        这里的 “sync” 指的是同一组关节目标作为一个整体发送，
+        不一定意味着调用线程阻塞等待执行完成。
+        Here, "sync" means the joint targets are sent as one synchronized group,
+        not necessarily that the caller blocks until motion finishes.
+        """
         joint_radians = self.clamp_joint_radians(list(joint_radians))
         joint_count = len(joint_radians)
 
@@ -478,6 +542,13 @@ class RobotController:
         acc: int = 0,
         blocking: bool = False,
     ):
+        """
+        移动单个关节 / Move one joint.
+
+        内部会先读取最近一次缓存的关节角，再只修改指定关节后整体下发。
+        Internally it starts from the cached latest joint state, modifies the requested joint,
+        and then sends the whole joint set.
+        """
         joints = self.get_last_joint_radians()
         if 0 <= joint_index < len(joints):
             joints[joint_index] = self.clamp_joint_rad(joint_index, rad)
@@ -497,6 +568,7 @@ class RobotController:
 
 
     def set_bus_address_1byte_value(self, device_id: int, address: int, value: int):
+        """向总线设备写入 1 字节寄存器 / Write a 1-byte register on the bus device."""
         '''
         Reliable cmd
         '''
@@ -510,6 +582,7 @@ class RobotController:
 
 
     def set_bus_address_2byte_value(self, device_id: int, address: int, value: int):
+        """向总线设备写入 2 字节寄存器 / Write a 2-byte register on the bus device."""
         '''
         Reliable cmd
         '''
@@ -542,6 +615,7 @@ class RobotController:
 
 
     def set_pwm_async(self, channel: int, pwm: int):
+        """异步设置 PWM 输出 / Set PWM output asynchronously."""
         if channel == 0:
             self.set_bus_address_2byte_value(self.node_id, 34, pwm)
         elif channel == 1:
@@ -549,12 +623,14 @@ class RobotController:
 
 
     def _enqueue_reliable_command(self, cmd: Dict[str, Any]):
+        """把命令放入可靠队列 / Push a command into the reliable queue."""
         with self.pending_lock:
             self.pending_reliable_commands.append(cmd)
         self.wakeup_event.set()
     
 
     def send_json(self, payload: Dict[str, Any], blocking: bool = False):
+        """发送原始 JSON 命令 / Send a raw JSON command."""
         if self.communication_mode != "json":
             raise RuntimeError("Not in the json mode")
 
@@ -567,9 +643,10 @@ class RobotController:
         return None
 
     # =====================================================
-    # direct_servo 执行
+    # direct_servo 执行 / direct_servo execution
     # =====================================================
     def _execute_direct_command_now(self, cmd: Dict[str, Any]):
+        """立即执行 direct_servo 命令 / Execute a direct_servo command immediately."""
         if self.packet_handler is None:
             raise RuntimeError("direct_servo not initialized yet")
 
@@ -594,6 +671,7 @@ class RobotController:
                 raise ValueError(f"unsupported direct command type: {cmd_type}")
 
     def _direct_write_move_joints(self, cmd: Dict[str, Any]):
+        """直接下发多关节目标 / Write a multi-joint target directly to the servo bus."""
         joint_radians = cmd["joint_radians"]
         speed = cmd["speed"]
         acc = cmd["acc"]
@@ -628,9 +706,10 @@ class RobotController:
 
 
     # =====================================================
-    # json 写入
+    # JSON 写入 / JSON writes
     # =====================================================
     def _execute_json_write_now(self, payload: Dict[str, Any]):
+        """立即发送一条 JSON 数据 / Write one JSON payload immediately."""
         if self.serial_connection is None or not self.serial_connection.is_open:
             raise RuntimeError("json uart not open")
 
@@ -640,9 +719,10 @@ class RobotController:
             return self.serial_connection.write(raw)
 
     # =====================================================
-    # direct_servo 读取
+    # direct_servo 读取 / direct_servo reads
     # =====================================================
     def _read_direct_feedback_once(self):
+        """轮询一次 direct_servo 反馈 / Poll direct_servo feedback once."""
         if self.packet_handler is None:
             return
 
@@ -660,6 +740,7 @@ class RobotController:
             }
 
     def _ft_read_snapshot_one(self, joint_index: int) -> Dict[str, Any]:
+        """读取单个关节快照 / Read one joint snapshot."""
         if self.packet_handler is None:
             raise RuntimeError("direct_servo not initialized yet")
 
@@ -676,17 +757,20 @@ class RobotController:
         return result
 
     def get_latest_feedback(self) -> Dict[str, Any]:
+        """获取最近一次反馈副本 / Get a copy of the latest feedback."""
         with self.latest_feedback_lock:
             return dict(self.latest_feedback)
 
     def get_last_joint_radians(self) -> List[float]:
+        """获取缓存的最近一次关节弧度 / Get cached latest joint radians."""
         with self.last_joint_radians_lock:
             return list(self.last_joint_radians)
 
     # =====================================================
-    # json 读取
+    # JSON 读取 / JSON reads
     # =====================================================
     def _read_json_available_once(self) -> bool:
+        """尽可能读取一批可用 JSON 数据 / Read one available batch of JSON UART data."""
         if self.serial_connection is None or not self.serial_connection.is_open:
             return False
 
@@ -695,6 +779,7 @@ class RobotController:
         with self.bus_lock:
             waiting = self.serial_connection.in_waiting
             if waiting <= 0:
+                # 没有串口数据可读 / no UART data available
                 return False
             data = self.serial_connection.read(min(waiting, self.json_read_chunk))
 
@@ -720,6 +805,8 @@ class RobotController:
             with self.json_rx_lock:
                 self.json_rx_queue.append(obj)
                 if len(self.json_rx_queue) > 200:
+                    # 只保留最近 200 条，避免缓存无限增长。
+                    # Keep only the newest 200 messages to avoid unbounded growth.
                     self.json_rx_queue = self.json_rx_queue[-200:]
 
             with self.latest_feedback_lock:
@@ -732,15 +819,17 @@ class RobotController:
         return did_read
 
     def read_json_message(self) -> Optional[Dict[str, Any]]:
+        """从接收队列取出一条 JSON 消息 / Pop one decoded JSON message from the RX queue."""
         with self.json_rx_lock:
             if not self.json_rx_queue:
                 return None
             return self.json_rx_queue.pop(0)
 
     # =====================================================
-    # 插值 / 规划线程
+    # 插值 / 规划线程 / Interpolation planner thread
     # =====================================================
     def _start_planner_thread(self):
+        """启动规划线程 / Start the planner thread."""
         if self.planner_thread is not None and self.planner_thread.is_alive():
             return
 
@@ -749,6 +838,7 @@ class RobotController:
         self.planner_thread.start()
 
     def _stop_planner_thread(self):
+        """停止规划线程 / Stop the planner thread."""
         self.planner_wakeup_event.set()
         if self.planner_thread is not None and self.planner_thread.is_alive():
             self.planner_thread.join(timeout=0.5)
@@ -756,13 +846,16 @@ class RobotController:
 
     def ik_ctrl(self, goal_position: Sequence[float], speed: float = 880):
         """
-        用户接口：
+        用户接口 / User API:
             ik_ctrl([x, y, z, g], speed)
 
-        非阻塞：
+        非阻塞 / Non-blocking:
         - 只写入新的规划目标
+          Only stores a new planner target.
         - 规划线程被唤醒
+          Wakes up the planner thread.
         - 旧轨迹自动失效，转向新目标
+          The previous trajectory becomes invalid automatically and execution switches to the new target.
         """
         if len(goal_position) != 4:
             raise ValueError("goal_position must be [x, y, z, g]")
@@ -779,14 +872,19 @@ class RobotController:
 
     def _planner_loop(self):
         """
+        规划线程主循环 / Planner thread main loop
+
         规划线程不直接访问串口。
-        它只负责：
-        1. 取当前目标
-        2. 计算当前末端到目标末端的插值点
-        3. 每一步调用 ik_generate() -> joints
-        4. 再调用 move_joints_rad_sync(..., blocking=False)
+        The planner thread never talks to the serial bus directly.
+
+        它只负责 / Responsibilities:
+        1. 取当前目标 / Fetch the current target.
+        2. 计算当前末端到目标末端的插值点 / Interpolate Cartesian waypoints from current pose to goal pose.
+        3. 每一步调用 ik_generate() -> joints / Convert each waypoint into joint targets through IK.
+        4. 再调用 move_joints_rad_sync(..., blocking=False) / Submit non-blocking joint targets to the motion slot.
 
         新目标到来时，通过 generation 机制让旧轨迹立刻失效。
+        When a new target arrives, the generation counter invalidates the old trajectory immediately.
         """
         while not self.stop_event.is_set():
             self.planner_wakeup_event.wait()
@@ -827,10 +925,12 @@ class RobotController:
                         latest_generation = self.planner_target["generation"] if self.planner_target else -1
 
                     if latest_generation != my_generation:
+                        # 发现更新世代号，说明有新目标覆盖当前轨迹。
+                        # A newer generation means the current trajectory has been superseded.
                         interrupted = True
                         break
 
-                    t = step_idx / steps
+                    t = step_idx / steps # 当前插值进度 / current interpolation progress
                     interp_pose = [
                         current_pose[i] + delta[i] * t
                         for i in range(3)
@@ -843,6 +943,8 @@ class RobotController:
                     )
 
                     if joints == False:
+                        # IK 失败通常意味着当前插值点不可达。
+                        # IK failure usually means the current interpolated waypoint is unreachable.
                         interrupted = True
                         break
 
@@ -865,6 +967,7 @@ class RobotController:
     
 
     def ik_ctrl_immediate(self, goal_position: Sequence[float], speed: Sequence[int] = [0,0,0,0]):
+        """立即执行 IK，不做插值 / Execute IK immediately without interpolation."""
         self.cancel_ik_ctrl()
         joints = self.ik_generate(
             goal_position[0],
@@ -885,6 +988,7 @@ class RobotController:
 
 
     def fpv_ctrl_immediate(self, goal_position: Sequence[float], speed: Sequence[int] = [0,0,0,0]):
+        """以 base/reach/z 形式立即控制 / Immediate control using base/reach/z coordinates."""
         '''
         goal_position = [base(rad), reach, z]
         '''
@@ -909,6 +1013,7 @@ class RobotController:
 
 
     def cancel_ik_ctrl(self):
+        """取消当前 IK 插值任务 / Cancel the current IK interpolation task."""
         with self.planner_lock:
             self.planner_generation += 1
             self.planner_target = None
@@ -922,6 +1027,12 @@ class RobotController:
         speed: int = 0,
         acc: int = 0,
     ):
+        """
+        可靠单关节移动 / Reliable single-joint motion.
+
+        该命令会进入可靠队列，适合不能被新高频命令覆盖的动作。
+        This command goes into the reliable queue, suitable for motions that must not be overwritten by newer high-rate commands.
+        """
         joints = self.get_last_joint_radians()
         if not (0 <= joint_index < len(joints)):
             raise IndexError(f"joint_index out of range: {joint_index}")
@@ -944,21 +1055,26 @@ class RobotController:
 
 
     def gripper_ctrl(self, rad: float, speed: int = 0, acc: int = 0):
+        """夹爪控制接口 / Gripper control helper."""
         self.torque_limit(self.joint_ids[3], self.gripper_torque_limit)
         return self.move_joint_rad_reliable(3, rad, speed, acc)
     
 
     def torque_off_all_joint(self):
+        """关闭所有关节力矩 / Disable torque on all joints."""
         for i in range(len(self.joint_ids)):
             self.torque_lock_ctrl(self.joint_ids[i], 0)
 
     def torque_lock_ctrl(self, id_input, value_input):
+        """设置单个舵机力矩开关 / Set torque enable/disable for one servo."""
         self.set_bus_address_1byte_value(id_input, self.torque_lock_address, value_input)
 
     def torque_limit(self, id_input, value_input):
+        """设置单个舵机力矩上限 / Set torque limit for one servo."""
         self.set_bus_address_2byte_value(id_input, self.torque_limit_address, value_input)
 
     def set_arm_middle_as_current_pos(self):
+        """把当前实测位置作为中位 / Capture current measured positions as servo middles."""
         feedback = self.get_latest_feedback()
         print(f"Raw feedback: {feedback}")
         joints = feedback["joints"]
@@ -970,6 +1086,7 @@ class RobotController:
 
 
     def save_joint_middle(self):
+        """把当前 servo_middle 写回配置文件 / Save current servo_middle values into the config file."""
         with open(self.config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
         config["linkarm"]["servo_middle"] = self.servo_middle
@@ -978,18 +1095,27 @@ class RobotController:
 
 
     # =====================================================
-    # IK / FK
+    # IK / FK / Inverse & forward kinematics
     # =====================================================
     def ik_generate(self, x: float, y: float, z: float) -> Optional[List[float]]:
         """
-        linkarm - ik
+        LinkArm 逆运动学 / LinkArm inverse kinematics
+
+        输入 / Input:
+            x, y, z 末端目标位置 / target end-effector position
+
+        输出 / Output:
+            [base, shoulder_front, shoulder_rear] 关节角（弧度）
+            Joint angles in radians.
+
+        返回 False 表示该点不可达或计算异常。
+        Returns False when the point is unreachable or the computation becomes invalid.
         """
         try:
             input_xyzg_buffer = [x, y, z]
-            rad_0 = math.atan2(-y, x)
-            # linkArmPlaneIK(sqrt(pow(x, 2) + pow(y, 2)) - (l_ef / 2), z);
-            x = math.sqrt(x*x + y*y) - (self.l_ef/2)
-            l_af = math.sqrt(x*x + z*z)
+            rad_0 = math.atan2(-y, x) # 底座旋转角 / base rotation angle
+            x = math.sqrt(x*x + y*y) - (self.l_ef/2) # 转成平面机构等效 x / equivalent planar x
+            l_af = math.sqrt(x*x + z*z) # A 到末端等效点的距离 / distance from A to equivalent end point
             theta = math.acos(-((self.l_ab*self.l_ab) - (l_af*l_af) - (self.l_bf*self.l_bf))/(2*l_af*self.l_bf))
             lambd = math.atan2(z, x)
             # output: the angle of the shoulder-front joint
@@ -1026,6 +1152,7 @@ class RobotController:
     
 
     def _angle_diff(self, a: float, b: float) -> float:
+        """计算归一化角差 / Compute wrapped angle difference in [-pi, pi]."""
         d = a - b
         while d > math.pi:
             d -= 2.0 * math.pi
@@ -1036,11 +1163,16 @@ class RobotController:
 
     def _ik_planar_angles(self, r: float, z: float):
         """
-        输入:
+        平面 IK 辅助函数 / Planar IK helper
+
+        输入 / Input:
             r: 末端在水平面的半径距离 sqrt(x^2 + y^2)
-            z: 末端高度
-        输出:
-            (alpha, beta)  —— 与 ik_generate() 返回的第2、3个角一致
+               End-effector radial distance in the horizontal plane.
+            z: 末端高度 / End-effector height
+
+        输出 / Output:
+            (alpha, beta) —— 与 ik_generate() 返回的第 2、3 个角一致
+            Same definitions as the 2nd and 3rd joint angles returned by ik_generate().
         """
         x = r - (self.l_ef / 2.0)
 
@@ -1097,16 +1229,20 @@ class RobotController:
         tol: float = 1e-6,
     ):
         """
-        输入:
+        正运动学求解 / Forward kinematics solver
+
+        输入 / Input:
             rad_0, alpha_target, beta_target
             这三个角度应与 ik_generate() 返回值的定义保持一致
+            These angles must use the same conventions as ik_generate().
 
-        输出:
+        输出 / Output:
             [x, y, z]
         """
 
         # ----------------------------
         # 先做一个粗搜索，找一个比较好的初值
+        # First perform a coarse search to find a good initial guess for Newton iteration.
         # ----------------------------
         reach = self.l_ab + self.l_bf
         r_min = max(1e-6, (self.l_ef / 2.0) - reach)
@@ -1118,7 +1254,7 @@ class RobotController:
         best_z = None
         best_err = float("inf")
 
-        # 优先尝试 current_xyzg 作为初值来源
+        # 优先尝试 current_xyzg 作为初值来源 / Prefer current_xyzg as the first initial guess
         if hasattr(self, "current_xyzg") and self.current_xyzg and len(self.current_xyzg) >= 3:
             cx, cy, cz = self.current_xyzg[:3]
             guess_r = math.sqrt(cx * cx + cy * cy)
@@ -1129,7 +1265,7 @@ class RobotController:
             except:
                 pass
 
-        # 粗网格搜索
+        # 粗网格搜索 / Coarse grid search
         grid_n = 21
         for i in range(grid_n):
             r = r_min + (r_max - r_min) * i / (grid_n - 1)
@@ -1150,7 +1286,9 @@ class RobotController:
         z = best_z
 
         # ----------------------------
-        # 牛顿迭代精修
+        # 牛顿迭代精修 / Newton refinement
+        # 在粗搜索得到的初值附近做局部迭代，提高解的精度。
+        # Refine the coarse solution locally to improve accuracy.
         # ----------------------------
         for _ in range(max_iter):
             try:
@@ -1174,7 +1312,7 @@ class RobotController:
             except:
                 return False
 
-            # Jacobian
+            # Jacobian / Numerical Jacobian
             j11 = self._angle_diff(a_r, a) / h
             j12 = self._angle_diff(a_z, a) / h
             j21 = self._angle_diff(b_r, b) / h
@@ -1184,11 +1322,11 @@ class RobotController:
             if abs(det) < 1e-10:
                 return False
 
-            # 解 J * [dr, dz]^T = -[e1, e2]^T
+            # 解 J * [dr, dz]^T = -[e1, e2]^T / Solve J * [dr, dz]^T = -[e1, e2]^T
             dr = (-e1 * j22 + e2 * j12) / det
             dz = (-j11 * e2 + j21 * e1) / det
 
-            # 可加一点步长限制，防止发散
+            # 可加一点步长限制，防止发散 / Clamp step size slightly to avoid divergence
             step_limit = 20.0
             dr = max(-step_limit, min(step_limit, dr))
             dz = max(-step_limit, min(step_limit, dz))
@@ -1202,6 +1340,7 @@ class RobotController:
         return False
     
     def get_fk_result(self):
+        """根据当前反馈计算 FK 结果 / Compute FK result from current joint feedback."""
         feedback = self.get_latest_feedback()
         joints_info = feedback["joints"]
 
@@ -1220,7 +1359,7 @@ class RobotController:
 
 
     # =====================================================
-    # with
+    # with / Context manager helpers
     # =====================================================
     def __enter__(self):
         if not self.is_connected:
@@ -1238,7 +1377,7 @@ class RobotController:
 
 
 # =============================================================================================================
-# LinkArm CLI SDK
+# LinkArm CLI SDK / LinkArm 命令行 SDK
 # =============================================================================================================
 # Command Line Interface for controlling the LinkArm robotic arm.
 
@@ -1262,6 +1401,9 @@ class RobotController:
 
 def _format_feedback_positions(feedback: Dict[str, Any]) -> List[Optional[int]]:
     """
+    从最新反馈中提取关节位置 / Extract joint positions from the latest feedback.
+    """
+    """
     Extract joint positions from the latest feedback dictionary.
 
     Returns:
@@ -1279,6 +1421,7 @@ def _format_feedback_positions(feedback: Dict[str, Any]) -> List[Optional[int]]:
 
 
 def _print_status(arm: RobotController):
+    """打印简洁状态摘要 / Print a compact runtime status summary."""
     """
     Print a compact runtime status summary.
     """
@@ -1293,6 +1436,7 @@ def _print_status(arm: RobotController):
 
 
 def _json_print(obj: Dict[str, Any]):
+    """以稳定 JSON 格式输出 / Print one object in a stable JSON format."""
     """
     Print one JSON object in a stable machine-friendly format.
     """
@@ -1300,6 +1444,9 @@ def _json_print(obj: Dict[str, Any]):
 
 
 def _sleep_after_nonblocking_command(cmd: Optional[str], seconds: float = 0.05):
+    """
+    为异步命令留一点发送时间 / Give async commands a short flush window.
+    """
     """
     Give the I/O thread a short window to flush queued commands before process exit.
 
@@ -1324,6 +1471,7 @@ def _sleep_after_nonblocking_command(cmd: Optional[str], seconds: float = 0.05):
 
 
 def _split_exec_commands(text: str) -> List[str]:
+    """按分号切分 exec 命令串 / Split an exec command string by semicolons."""
     """
     Split a semicolon-separated command string.
 
@@ -1335,6 +1483,7 @@ def _split_exec_commands(text: str) -> List[str]:
 
 
 def _run_shell_line(arm: RobotController, line: str, json_output: bool = False) -> Dict[str, Any]:
+    """执行一行 shell 命令并返回结构化结果 / Execute one shell command line and return a structured result."""
     """
     Execute one shell-style command line and return a structured result.
 
@@ -1561,6 +1710,7 @@ def _run_shell_line(arm: RobotController, line: str, json_output: bool = False) 
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器 / Build the command-line argument parser."""
     """
     Build the command line parser.
 
@@ -1691,6 +1841,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _execute_cli_command(arm: RobotController, args: argparse.Namespace):
+    """执行解析后的 CLI 命令 / Execute one parsed CLI command."""
     """
     Execute one parsed CLI command.
     """
@@ -1887,6 +2038,7 @@ def _execute_cli_command(arm: RobotController, args: argparse.Namespace):
 
 
 def _run_interactive_shell(arm: RobotController, json_output: bool = False):
+    """运行交互式命令行 / Run the interactive command shell."""
     """
     Run an interactive shell for manual control.
     """
