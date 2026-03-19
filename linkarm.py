@@ -1428,6 +1428,7 @@ def _print_status(arm: RobotController):
     feedback = arm.get_latest_feedback()
     positions = _format_feedback_positions(feedback)
     print("Connected:", arm.is_connected)
+    print("PortName", arm.serial_port_name)
     print("Mode:", feedback.get("mode"))
     print("Timestamp:", feedback.get("timestamp"))
     print("Joint positions:", positions)
@@ -1514,6 +1515,7 @@ def _run_shell_line(arm: RobotController, line: str, json_output: bool = False) 
             feedback = arm.get_latest_feedback()
             result = {
                 "connected": arm.is_connected,
+                "port": arm.serial_port_name,
                 "mode": feedback.get("mode"),
                 "timestamp": feedback.get("timestamp"),
                 "joint_positions": _format_feedback_positions(feedback),
@@ -1877,6 +1879,7 @@ def _execute_cli_command(arm: RobotController, args: argparse.Namespace):
             feedback = arm.get_latest_feedback()
             result = {
                 "connected": arm.is_connected,
+                "port": arm.serial_port_name,
                 "mode": feedback.get("mode"),
                 "timestamp": feedback.get("timestamp"),
                 "joint_positions": _format_feedback_positions(feedback),

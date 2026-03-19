@@ -1,7 +1,7 @@
 {
   "linkarm": {
     "device_info_keyword": "CH343",
-    "default_device_serial_ports": "COM42",
+    "default_device_serial_ports": "",
     "serial_baudrate": 500000,
     "joint_type": "scs",
     "joint_id": [
