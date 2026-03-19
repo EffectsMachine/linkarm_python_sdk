@@ -1,5 +1,7 @@
 # LinkArm CLI SDK
 
+🌐 Language: [English](./README_EN.md) | 中文
+
 用于控制 **LinkArm 机械臂** 的 Python 命令行工具与 SDK。
 
 本项目提供：
