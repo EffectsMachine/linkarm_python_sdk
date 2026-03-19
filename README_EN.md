@@ -150,7 +150,7 @@ Controller + Servos
 ## Environment Setup
 
 ```bash
-git clone https://github.com/EffectsMachine/linkarm_python_sdk.git
+git clone https://github.com/LygionOrganization/linkarm_python_sdk.git
 cd linkarm_module
 pip install -r requirements.txt
 ```

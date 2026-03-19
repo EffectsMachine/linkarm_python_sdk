@@ -236,7 +236,7 @@ python --version
 ### 2. 获取项目
 
 ```bash
-git clone https://github.com/EffectsMachine/linkarm_python_sdk.git
+git clone https://github.com/LygionOrganization/linkarm_python_sdk.git
 cd linkarm_module
 ```
 
@@ -1270,8 +1270,6 @@ help
 ---
 
 ## 许可证
-
-请根据你的项目实际情况填写，例如：
 
 ```text
 MIT License
